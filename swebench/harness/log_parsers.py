@@ -1,12 +1,6 @@
 import re
 from enum import Enum
-
-
-class TestStatus(Enum):
-    FAILED = "FAILED"
-    PASSED = "PASSED"
-    SKIPPED = "SKIPPED"
-    ERROR = "ERROR"
+from swebench.harness.constants import TestStatus
 
 
 def parse_log_pytest(log: str) -> dict[str, str]:
@@ -73,12 +67,18 @@ def parse_log_django(log: str) -> dict[str, str]:
     """
     test_status_map = {}
     lines = log.split("\n")
+
+    prev_test = None
     for line in lines:
         line = line.strip()
 
         # This isn't ideal but the test output spans multiple lines
         if "--version is equivalent to version" in line:
             test_status_map["--version is equivalent to version"] = TestStatus.PASSED.value
+
+        # Log it in case of error
+        if " ... " in line:
+            prev_test = line.split(" ... ")[0]
 
         pass_suffixes = (" ... ok", " ... OK", " ...  OK")
         for suffix in pass_suffixes:
@@ -106,6 +106,12 @@ def parse_log_django(log: str) -> dict[str, str]:
         if line.startswith("ERROR:"):
             test = line.split()[1].strip()
             test_status_map[test] = TestStatus.ERROR.value
+
+        if line.lstrip().startswith("ok") and prev_test is not None:
+            # It means the test passed, but there's some additional output (including new lines)
+            # between "..." and "ok" message
+            test = prev_test
+            test_status_map[test] = TestStatus.PASSED.value
 
     # TODO: This is very brittle, we should do better
     # There's a bug in the django logger, such that sometimes a test output near the end gets
@@ -146,6 +152,10 @@ def parse_log_pytest_v2(log: str) -> dict[str, str]:
                 line = line.replace(" - ", " ")
             test_case = line.split()
             test_status_map[test_case[1]] = test_case[0]
+        # Support older pytest versions by checking if the line ends with the test status
+        elif any([line.endswith(x.value) for x in TestStatus]):
+            test_case = line.split()
+            test_status_map[test_case[0]] = test_case[1]
     return test_status_map
 
 

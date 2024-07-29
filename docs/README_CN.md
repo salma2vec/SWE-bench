@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://github.com/princeton-nlp/Llamao">
-    <img src="assets/swellama_banner.png" width="50%" alt="Kawi the SWE-Llama" />
+    <img src="assets/figures/swellama_banner.png" width="50%" alt="Kawi the SWE-Llama" />
   </a>
 </p>
 
@@ -33,7 +33,7 @@
 SWE-bench 是一个用于评估大型语言模型的基准，这些模型是从 GitHub 收集的真实软件问题。
 给定一个 *代码库* 和一个 *问题*，语言模型的任务是生成一个 *补丁* 来解决所描述的问题。
 
-<img src="assets/teaser.png">
+<img src="assets/figures/teaser.png">
 
 ## 🚀 设置
 要从源代码构建 SWE-bench，请按照以下步骤操作:
@@ -63,7 +63,7 @@ SWE-bench 是一个用于评估大型语言模型的基准，这些模型是从 
 ## 🍎 教程
 我们还写了关于如何使用SWE-bench不同部分的博客文章。
 如果您想看到关于特定主题的文章，请通过问题告诉我们。
-* [Nov 1. 2023] Collecting Evaluation Tasks for SWE-Bench ([🔗](https://github.com/princeton-nlp/SWE-bench/tree/main/swebench/collect/collection.md.md))
+* [Nov 1. 2023] Collecting Evaluation Tasks for SWE-Bench ([🔗](https://github.com/princeton-nlp/SWE-bench/tree/main/swebench/assets/collection.md))
 * [Nov 6. 2023] Evaluating on SWE-bench ([🔗](https://github.com/princeton-nlp/SWE-bench/tree/main/swebench/harness/evaluation.md))
 
 ## 💫 贡献

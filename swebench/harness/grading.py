@@ -6,6 +6,7 @@ from swebench.harness.constants import (
     APPLY_PATCH_PASS,
     FAIL_TO_FAIL,
     FAIL_TO_PASS,
+    KEY_INSTANCE_ID,
     PASS_TO_FAIL,
     PASS_TO_PASS,
     RESET_FAILED,
@@ -19,18 +20,6 @@ from swebench.harness.log_parsers import MAP_REPO_TO_PARSER
 
 
 # MARK: Utility functions
-def get_file_name_from_lp(x: str) -> str:
-    return x.rsplit("/", 1)[-1]
-
-
-def get_id_from_lp(x: str) -> str:
-    return get_file_name_from_lp(x).split(".")[0]
-
-
-def get_repo_from_lp(x: str) -> str:
-    return get_id_from_lp(x).rsplit("-", 1)[0].replace("__", "/")
-
-
 def test_passed(case: str, sm: dict[str, str]) -> bool:
     return case in sm and sm[case] == TestStatus.PASSED.value
 
@@ -41,6 +30,7 @@ def test_failed(case: str, sm: dict[str, str]) -> bool:
     )
 
 
+# MARK: Evaluation report functions
 def get_logs_eval(log_fp: str) -> tuple[dict[str, str], bool]:
     """
     Retrieve evaluation results for a task instance from its corresponding log file
@@ -84,7 +74,7 @@ def get_logs_eval(log_fp: str) -> tuple[dict[str, str], bool]:
         return log_parser(content), True
 
 
-def get_eval_report(
+def get_eval_tests_report(
     eval_sm: dict[str, str],
     gold_results: dict[str, str],
     calculate_to_fail: bool = False,
@@ -216,7 +206,7 @@ def get_resolution_status(report: dict[str, dict[str, Any]]) -> str:
         return ResolvedStatus.NO.value
     
 
-def get_pred_report(
+def get_eval_report(
     test_spec: TestSpec,
     prediction: dict[str, str],
     log_path: str,
@@ -227,7 +217,7 @@ def get_pred_report(
     and evaluation log.
 
     Args:
-        test_spec (dict): test spec containing keys "instance_id", "FAIL_TO_PASS", and "PASS
+        test_spec (dict): test spec containing keys "instance_id", "FAIL_TO_PASS", and "PASS_TO_PASS"
         prediction (dict): prediction containing keys "instance_id", "model_name_or_path", and "model_patch"
         log_path (str): path to evaluation log
         include_tests_status (bool): whether to include the status of each test in the returned report
@@ -236,7 +226,7 @@ def get_pred_report(
     """
     report_map = {}
 
-    instance_id = prediction["instance_id"]
+    instance_id = prediction[KEY_INSTANCE_ID]
     if instance_id not in report_map:
         report_map[instance_id] = {
             "patch_is_None": False,
@@ -259,13 +249,13 @@ def get_pred_report(
     report_map[instance_id]["patch_successfully_applied"] = True
 
     eval_ref = {
-        "instance_id": test_spec.instance_id,
-        "FAIL_TO_PASS": test_spec.FAIL_TO_PASS,
-        "PASS_TO_PASS": test_spec.PASS_TO_PASS,
+        KEY_INSTANCE_ID: test_spec.instance_id,
+        FAIL_TO_PASS: test_spec.FAIL_TO_PASS,
+        PASS_TO_PASS: test_spec.PASS_TO_PASS,
     }
 
-    report = get_eval_report(eval_sm, eval_ref)
-    if get_resolution_status(report) == "RESOLVED_FULL":
+    report = get_eval_tests_report(eval_sm, eval_ref)
+    if get_resolution_status(report) == ResolvedStatus.FULL.value:
         report_map[instance_id]["resolved"] = True
 
     if include_tests_status:

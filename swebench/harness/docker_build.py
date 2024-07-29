@@ -10,7 +10,7 @@ from swebench.harness.constants import (
     BASE_IMAGE_BUILD_DIR,
     ENV_IMAGE_BUILD_DIR,
     INSTANCE_IMAGE_BUILD_DIR,
-    MAP_VERSION_TO_INSTALL,
+    MAP_REPO_VERSION_TO_SPECS,
 )
 from swebench.harness.test_spec import (
     get_test_specs_from_dataset,
@@ -29,15 +29,14 @@ ansi_escape = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 class BuildImageError(Exception):
     def __init__(self, image_name, message, logger):
         super().__init__(message)
+        self.super_str = super().__str__()
         self.image_name = image_name
         self.log_path = logger.log_file
         self.logger = logger
 
     def __str__(self):
-        log_msg = traceback.format_exc()
-        self.logger.info(log_msg)
         return (
-            f"{self.image_name}: {super().__str__()}\n"
+            f"Error building image {self.image_name}: {self.super_str}\n"
             f"Check ({self.log_path}) for more information."
         )
 
@@ -240,7 +239,7 @@ def get_env_configs_to_build(
 
             if env_image.attrs["Created"] < base_image.attrs["Created"]:
                 # Remove the environment image if it was built after the base_image
-                for dep in find_dependent_images(env_image):
+                for dep in find_dependent_images(client, test_spec.env_image_key):
                     # Remove instance images that depend on this environment image
                     remove_image(client, dep.image_id, "quiet")
                 remove_image(client, test_spec.env_image_key, "quiet")
@@ -281,7 +280,7 @@ def build_env_images(
     configs_to_build = get_env_configs_to_build(client, dataset)
     if len(configs_to_build) == 0:
         print("No environment images need to be built.")
-        return
+        return [], []
     print(f"Total environment images to build: {len(configs_to_build)}")
 
     # Build the environment images
@@ -340,7 +339,7 @@ def build_instance_images(
     ):
     """
     Builds the instance images required for the dataset if they do not already exist.
-    
+
     Args:
         dataset (list): List of test specs or dataset to build images for
         client (docker.DockerClient): Docker client to use for building the images
@@ -508,7 +507,7 @@ def build_container(
     container = None
     try:
         # Get configurations for how container should be created
-        config = MAP_VERSION_TO_INSTALL[test_spec.repo][test_spec.version]
+        config = MAP_REPO_VERSION_TO_SPECS[test_spec.repo][test_spec.version]
         user = "root" if not config.get("execute_test_as_nonroot", False) else "nonroot"
         nano_cpus = config.get("nano_cpus")
 

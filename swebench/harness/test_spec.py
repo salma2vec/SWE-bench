@@ -4,13 +4,15 @@ import platform
 import re
 
 from dataclasses import dataclass
-from typing import Any, Union
+from typing import Any, Union, cast
 
 from swebench.harness.constants import (
     SWEbenchInstance,
+    KEY_INSTANCE_ID,
+    FAIL_TO_PASS,
+    PASS_TO_PASS,
     MAP_REPO_TO_INSTALL,
-    MAP_VERSION_TO_INSTALL,
-    MAP_REPO_TO_TEST_FRAMEWORK,
+    MAP_REPO_VERSION_TO_SPECS,
     USE_X86,
 )
 from swebench.harness.dockerfiles import (
@@ -35,9 +37,9 @@ class TestSpec:
     instance_id: str
     repo: str
     version: str
-    repo_script_list: str
-    eval_script_list: str
-    env_script_list: str
+    repo_script_list: list[str]
+    eval_script_list: list[str]
+    env_script_list: list[str]
     arch: str
     FAIL_TO_PASS: list[str]
     PASS_TO_PASS: list[str]
@@ -102,18 +104,18 @@ class TestSpec:
             return "linux/arm64/v8"
         else:
             raise ValueError(f"Invalid architecture: {self.arch}")
-        
+
 
 def get_test_specs_from_dataset(dataset: Union[list[SWEbenchInstance], list[TestSpec]]) -> list[TestSpec]:
     """
     Idempotent function that converts a list of SWEbenchInstance objects to a list of TestSpec objects.
     """
     if isinstance(dataset[0], TestSpec):
-        return dataset
-    return list(map(make_test_spec, dataset))
+        return cast(list[TestSpec], dataset)
+    return list(map(make_test_spec, cast(list[SWEbenchInstance], dataset)))
 
 
-def make_repo_script_list(install, repo, repo_directory, base_commit, env_name):
+def make_repo_script_list(specs, repo, repo_directory, base_commit, env_name):
     """
     Create a list of bash commands to set up the repository for testing.
     This is the setup script for the instance image.
@@ -134,16 +136,16 @@ def make_repo_script_list(install, repo, repo_directory, base_commit, env_name):
         setup_commands.append(MAP_REPO_TO_INSTALL[repo])
 
     # Run pre-install set up if provided
-    if "pre_install" in install:
-        for pre_install in install["pre_install"]:
+    if "pre_install" in specs:
+        for pre_install in specs["pre_install"]:
             setup_commands.append(pre_install)
 
-    if "install" in install:
-        setup_commands.append(install["install"])
+    if "install" in specs:
+        setup_commands.append(specs["install"])
     return setup_commands
 
 
-def make_env_script_list(instance, install, env_name):
+def make_env_script_list(instance, specs, env_name):
     """
     Creates the list of commands to set up the conda environment for testing.
     This is the setup script for the environment image.
@@ -153,10 +155,10 @@ def make_env_script_list(instance, install, env_name):
         "source /opt/miniconda3/bin/activate",
     ]
     # Create conda environment according to install instructinos
-    pkgs = install.get("packages", "")
+    pkgs = specs.get("packages", "")
     if pkgs == "requirements.txt":
         # Create environment
-        cmd = f"conda create -n {env_name} python={install['python']} -y"
+        cmd = f"conda create -n {env_name} python={specs['python']} -y"
         reqs_commands.append(cmd)
 
         # Install dependencies
@@ -175,9 +177,9 @@ def make_env_script_list(instance, install, env_name):
         reqs_commands.append(
             f"cat <<'{HEREDOC_DELIMITER}' > {path_to_reqs}\n{reqs}\n{HEREDOC_DELIMITER}"
         )
-        if "no_use_env" in install and install["no_use_env"]:
+        if "no_use_env" in specs and specs["no_use_env"]:
             # `conda create` based installation
-            cmd = f"conda create -c conda-forge -n {env_name} python={install['python']} -y"
+            cmd = f"conda create -c conda-forge -n {env_name} python={specs['python']} -y"
             reqs_commands.append(cmd)
 
             # Install dependencies
@@ -188,27 +190,27 @@ def make_env_script_list(instance, install, env_name):
             cmd = f"conda env create --file {path_to_reqs}"
             reqs_commands.append(cmd)
 
-            cmd = f"conda activate {env_name} && conda install python={install['python']} -y"
+            cmd = f"conda activate {env_name} && conda install python={specs['python']} -y"
             reqs_commands.append(cmd)
 
         # Remove environment.yml
         reqs_commands.append(f"rm {path_to_reqs}")
     else:
         # Create environment + install dependencies
-        cmd = f"conda create -n {env_name} python={install['python']} {pkgs} -y"
+        cmd = f"conda create -n {env_name} python={specs['python']} {pkgs} -y"
         reqs_commands.append(cmd)
 
     reqs_commands.append(f"conda activate {env_name}")
 
     # Install additional packages if specified
-    if "pip_packages" in install:
-        pip_packages = " ".join(install["pip_packages"])
+    if "pip_packages" in specs:
+        pip_packages = " ".join(specs["pip_packages"])
         cmd = f"python -m pip install {pip_packages}"
         reqs_commands.append(cmd)
     return reqs_commands
 
 
-def make_eval_script_list(instance, install, env_name, repo_directory, base_commit, test_patch):
+def make_eval_script_list(instance, specs, env_name, repo_directory, base_commit, test_patch):
     """
     Applies the test patch and runs the tests.
     """
@@ -221,7 +223,7 @@ def make_eval_script_list(instance, install, env_name, repo_directory, base_comm
     )
     test_command = " ".join(
         [
-            MAP_REPO_TO_TEST_FRAMEWORK[instance["repo"]][instance["version"]],
+            MAP_REPO_VERSION_TO_SPECS[instance["repo"]][instance["version"]]["test_cmd"],
             *get_test_directives(instance),
         ]
     )
@@ -230,8 +232,8 @@ def make_eval_script_list(instance, install, env_name, repo_directory, base_comm
         f"conda activate {env_name}",
         f"cd {repo_directory}",
     ]
-    if "eval_commands" in install:
-        eval_commands += install["eval_commands"]
+    if "eval_commands" in specs:
+        eval_commands += specs["eval_commands"]
     eval_commands += [
         f"git config --global --add safe.directory {repo_directory}",  # for nonroot user
         f"cd {repo_directory}",
@@ -242,8 +244,8 @@ def make_eval_script_list(instance, install, env_name, repo_directory, base_comm
         "source /opt/miniconda3/bin/activate",
         f"conda activate {env_name}",
     ]
-    if "install" in install:
-        eval_commands.append(install["install"])
+    if "install" in specs:
+        eval_commands.append(specs["install"])
     eval_commands += [
         reset_tests_command,
         apply_test_patch_command,
@@ -256,7 +258,7 @@ def make_eval_script_list(instance, install, env_name, repo_directory, base_comm
 def make_test_spec(instance: SWEbenchInstance) -> TestSpec:
     if isinstance(instance, TestSpec):
         return instance
-    instance_id = instance["instance_id"]
+    instance_id = instance[KEY_INSTANCE_ID]
     repo = instance["repo"]
     version = instance["version"]
     base_commit = instance["base_commit"]
@@ -270,17 +272,17 @@ def make_test_spec(instance: SWEbenchInstance) -> TestSpec:
             return json.loads(instance[key])
         return instance[key]
 
-    pass_to_pass = _from_json_or_obj("PASS_TO_PASS")
-    fail_to_pass = _from_json_or_obj("FAIL_TO_PASS")
+    pass_to_pass = _from_json_or_obj(PASS_TO_PASS)
+    fail_to_pass = _from_json_or_obj(FAIL_TO_PASS)
 
     env_name = "testbed"
     repo_directory = f"/{env_name}"
-    install = MAP_VERSION_TO_INSTALL[repo][version]
+    specs = MAP_REPO_VERSION_TO_SPECS[repo][version]
 
-    repo_script_list = make_repo_script_list(install, repo, repo_directory, base_commit, env_name)
-    env_script_list = make_env_script_list(instance, install, env_name)
+    repo_script_list = make_repo_script_list(specs, repo, repo_directory, base_commit, env_name)
+    env_script_list = make_env_script_list(instance, specs, env_name)
     eval_script_list = make_eval_script_list(
-        instance, install, env_name, repo_directory, base_commit, test_patch
+        instance, specs, env_name, repo_directory, base_commit, test_patch
     )
     if platform.machine() in {"aarch64", "arm64"}:
         # use arm64 unless explicitly specified

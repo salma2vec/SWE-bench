@@ -4,6 +4,49 @@ All notable changes to the PyPI package for SWE-bench ([`swebench`](https://pypi
 
 Prior to version 1.1.0, not all deployed versions are listed, as the PyPI package was going through development and testing. The noteworthy versions and the respective changes that were introduced by that version are included. All versions 1.1.0 onwards are fully listed.
 
+## [2.0.12] - 7/21/2024
+* Minor naming changes
+* #186 fix: correct some typings and a incorrect function call
+* #183 Fix timeout
+* #178 Add schema version to report card
+* #177 Fix run live scripts
+
+## [2.0.9] - 7/10/2024
+* #176 Move inference to swebench.inference sub-package
+* #175 Fix link in collect README.md
+
+## [2.0.8] - 7/8/2024
+* Add `cutoff_date`, `max_pulls` arguments to collection pipeline
+* Minor Django issue comment parsing logic
+* Rewritten `extract_patches` logic
+* Remove `MAP_REPO_TO_TEST_FRAMEWORK` symbol
+
+## [2.0.4] - 7/5/2024
+* #173 Fix: Allow to set GH token from env var in collect/print_pulls
+* #171 Don't let tox install a virtualenv during evaluation
+* #169 Handle failures because of None/empty patches
+
+## [2.0.3] - 7/2/2024
+* #149 Interface fix: run_id is required
+* #151 Fix: Support JSON datasets (avoid loading json twice)
+* #152 Add very simple CI
+* #153 Various nitpicks
+* #155 Fix link to collection tutorial
+* #161 Fix path to image in docs
+* #162 Fix evaluation hanging issue and improve patch apply
+* #164 Fix so it doesn't crash when no env imgs to build
+* #166 Fix newline outputs for django's log parser
+* #168 Update reporting and skip empty model patch predictions
+
+## [2.0.0] - 6/27/2024
+Major release - the SWE-bench evaluation harness has been upgraded to incorporate containerized, sandboxed execution environments based on Docker. There are several chances to the API resulting from this:
+* Removal of the `swebench.metrics` module
+* Updates to the API of `swebench.harness` functionality
+* Significant modifications to underlying evaluation logic
+* Minor updates to installation specifications for different repos + versions.
+
+Read the full report [here](https://github.com/princeton-nlp/SWE-bench/tree/main/docs/20240627_docker)
+
 ## [1.1.5] - 5/15/2024
 * Add support for HumanEvalFix (Python, JS, Go, Java) ([source](https://huggingface.co/datasets/bigcode/humanevalpack))
 

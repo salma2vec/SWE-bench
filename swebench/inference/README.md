@@ -1,5 +1,5 @@
 # SWE-bench Inference
-In this package, we provide various tools to get started on SWE-bench inference.
+In this sub-package, we provide various tools to get started on SWE-bench inference.
 In particular, we provide the following important scripts and sub-packages:
 
 - `make_datasets`, this sub-package contains scripts to generate new datasets for SWE-bench inference with your own prompts and issues.
@@ -7,8 +7,14 @@ In particular, we provide the following important scripts and sub-packages:
 - `run_llama.py`, this script is used to run inference using Llama models, i.e. SWE-Llama.
 - `run_live.py`, this script is used to generate model generations for new issues on GitHub in real time.
 
+## Installation
+To install the dependencies for this sub-package, you can run the following command:
+```bash
+pip install -e .[inference]
+```
+
 ## `make_datasets`
-For more information on how to use this sub-package, please refer to the [README](./make_datasets/README.md) in the sub-package.
+For more information on how to use this sub-package, please refer to the [README](./make_datasets/README.md) in the `make_datasets` sub-package.
 
 ## Run API inference on test datasets
 
@@ -17,7 +23,7 @@ This python script is designed to run inference on a dataset using either the Op
 For instance, to run this script on SWE-bench with the ``Oracle`` context and Anthropic's Claude 2 model, you can run the following command:
 ```bash
 export ANTHROPIC_API_KEY=<your key>
-python run_api.py --dataset_name_or_path princeton-nlp/SWE-bench_oracle --model_name_or_path claude-2 --output_dir ./outputs
+python -m swebench.inference.run_api --dataset_name_or_path princeton-nlp/SWE-bench_oracle --model_name_or_path claude-2 --output_dir ./outputs
 ```
 
 You can also specify further options:
@@ -35,7 +41,11 @@ This script is similar to `run_api.py`, but it is designed to run inference usin
 
 For instance, to run this script on SWE-bench with the ``Oracle`` context and SWE-Llama, you can run the following command:
 ```bash
-python run_llama.py --dataset_path princeton-nlp/SWE-bench_oracle --model_name_or_path princeton-nlp/SWE-Llama-13b --output_dir ./outputs --temperature 0
+python -m swebench.inference.run_llama \
+    --dataset_path princeton-nlp/SWE-bench_oracle \
+    --model_name_or_path princeton-nlp/SWE-Llama-13b \
+    --output_dir ./outputs \
+    --temperature 0
 ```
 
 You can also specify further options:
@@ -48,12 +58,12 @@ You can also specify further options:
 
 ## Run live inference on open GitHub issues
 
-Follow instructions [here](https://github.com/castorini/pyserini/blob/master/docs/installation.md) to install [Pyserini](https://github.com/castorini/pyserini), to perform BM25 retrieval.
+Follow instructions [here](https://github.com/castorini/pyserini/blob/master/docs/installation.md) to install [Pyserini](https://github.com/castorini/pyserini), to perform BM25 retrieval, and [here](https://github.com/facebookresearch/faiss/blob/main/INSTALL.md) to install [Faiss](https://github.com/facebookresearch/faiss).
 
 Then run `run_live.py` to try solving a new issue. For example, you can try solving [this issue](https://github.com/huggingface/transformers/issues/26706 ) by running the following command:
 
 ```bash
 export OPENAI_API_KEY=<your key>
-python run_live.py --model_name gpt-3.5-turbo-1106 \
+python -m swebench.inference.run_live --model_name gpt-3.5-turbo-1106 \
     --issue_url https://github.com/huggingface/transformers/issues/26706 
 ```
