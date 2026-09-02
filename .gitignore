@@ -167,12 +167,11 @@ cython_debug/
 *.jsonl.*
 *.patch
 *.DS_Store
-analysis/**/*.json
-analysis/**/scratch*
-analysis/benchmark/plots/
-analysis/evaluation/*.csv
-analysis/evaluation/*.pdf
 data/repos/copies
 notebooks/
-image_build_logs/
-run_instance_logs/
+*logs/
+
+# run_evaluation writes these summaries into cwd
+gold.*.json
+loose-ends.txt
+todo_later.txt

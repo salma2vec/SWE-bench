@@ -1,309 +1,190 @@
 import json
-import os
-from pathlib import Path
-import re
-import requests
+import traceback
 
 from argparse import ArgumentTypeError
-from datasets import Dataset, load_dataset
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datasets import Dataset, load_dataset, load_from_disk
 from dotenv import load_dotenv
-from functools import cache
-from git import Repo
+from pathlib import Path
+from tqdm import tqdm
 from typing import cast
-
 from swebench.harness.constants import (
-    SWEbenchInstance,
-    MAP_REPO_TO_ENV_YML_PATHS,
-    MAP_REPO_TO_REQS_PATHS,
-    NON_TEST_EXTS,
-    SWE_BENCH_URL_RAW,
+    END_TEST_OUTPUT,
+    TEST_EXIT_CODE,
+    TEST_EXIT_CODE_VAR,
 )
+from swebench.types import SWEbenchInstance, TestSpec
+
 
 load_dotenv()
 
 
-def load_swebench_dataset(name="princeton-nlp/SWE-bench", split="test") -> list[SWEbenchInstance]:
+class EvaluationError(Exception):
+    def __init__(self, instance_id, message, logger):
+        super().__init__(message)
+        self.super_str = super().__str__()
+        self.instance_id = instance_id
+        self.log_path = logger.log_file
+        self.logger = logger
+
+    def __str__(self):
+        return (
+            f"Error in evaluation for {self.instance_id}: {self.super_str}\n"
+            f"Check ({self.log_path}) for more information."
+        )
+
+
+def get_predictions_from_file(
+    predictions_path: str,
+    dataset_name: str,
+    split: str,
+    task_repo: str | None = None,
+    instance_ids: list | None = None,
+):
+    if predictions_path == "gold":
+        print("Using gold predictions - ignoring predictions_path")
+        # the gold patch has to come from wherever the rest of the instance came from,
+        # or a run against a task repo silently grades the dataset's patch instead and
+        # never notices the two disagreeing
+        if task_repo:
+            from swebench.task.repo import load_task_repo
+
+            dataset = load_task_repo(task_repo, instance_ids)
+            if not instance_ids:
+                dataset = [d for d in dataset if d.get("split") == split]
+        else:
+            dataset = load_swebench_dataset(dataset_name, split, instance_ids)
+        return [
+            {
+                "instance_id": datum["instance_id"],
+                "model_patch": datum["patch"],
+                "model_name_or_path": "gold",
+            }
+            for datum in dataset
+        ]
+    if predictions_path.endswith(".json"):
+        with open(predictions_path, "r") as f:
+            predictions = json.load(f)
+            if isinstance(predictions, dict):
+                predictions = list(
+                    predictions.values()
+                )  # compatible with SWE-agent predictions
+            if not isinstance(predictions, list):
+                raise ValueError(
+                    "Predictions must be a list[prediction] or a dictionary[instance_id: prediction]"
+                )
+    elif predictions_path.endswith(".jsonl"):
+        with open(predictions_path, "r") as f:
+            predictions = [json.loads(line) for line in f]
+    else:
+        raise ValueError("Predictions path must be .json or .jsonl")
+
+    # Validate that each prediction has an instance_id
+    for pred in predictions:
+        if not isinstance(pred, dict):
+            raise ValueError(f"Each prediction must be a dictionary, got {type(pred)}")
+        if "instance_id" not in pred:
+            raise ValueError(f"Each prediction must contain '{'instance_id'}'")
+
+    return predictions
+
+
+def run_threadpool(func, payloads, max_workers):
+    if max_workers <= 0:
+        return run_sequential(func, payloads)
+    succeeded, failed = [], []
+    with tqdm(total=len(payloads), smoothing=0) as pbar:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Create a future for running each instance
+            futures = {executor.submit(func, *payload): payload for payload in payloads}
+            # Wait for each future to complete
+            for future in as_completed(futures):
+                try:
+                    # Check if instance ran successfully
+                    future.result()
+                    succeeded.append(futures[future])
+                except Exception as e:
+                    print(f"{type(e)}: {e}")
+                    traceback.print_exc()
+                    failed.append(futures[future])
+                # Update progress bar
+                pbar.update(1)
+                pbar.set_description(
+                    f"{len(succeeded)} ran successfully, {len(failed)} failed"
+                )
+    return succeeded, failed
+
+
+def run_sequential(func, args_list):
+    """
+    Run a function with a list of arguments sequentially
+    """
+    succeeded, failed = [], []
+    pbar = tqdm(total=len(args_list), smoothing=0)
+    for args in args_list:
+        try:
+            func(*args)
+            succeeded.append(args)
+        except Exception:
+            traceback.print_exc()
+            failed.append(args)
+        pbar.update(1)
+        pbar.set_description(f"{len(succeeded)} ran successfully, {len(failed)} failed")
+    pbar.close()
+    return succeeded, failed
+
+
+def load_swebench_dataset(
+    name="SWE-bench/SWE-bench", split="test", instance_ids=None
+) -> list[SWEbenchInstance]:
     """
     Load SWE-bench dataset from Hugging Face Datasets or local .json/.jsonl file
     """
-    # Load from local .json/.jsonl file
-    if name.endswith(".json") or name.endswith(".jsonl"):
-        return [
-            cast(SWEbenchInstance, instance)
-            for instance in json.loads(Path(name).read_text())
+    # check that all instance IDs are in the dataset
+    if instance_ids:
+        instance_ids = set(instance_ids)
+    # Load from local file
+    if name.endswith(".json"):
+        dataset = json.loads(Path(name).read_text())
+    elif name.endswith(".jsonl"):
+        dataset = [json.loads(line) for line in Path(name).read_text().splitlines()]
+    elif name.endswith(".parquet"):
+        dataset = cast(Dataset, load_dataset("parquet", data_files=name, split="train"))
+    else:
+        # Load from Hugging Face Datasets
+        if name.lower() in {"swe-bench", "swebench", "swe_bench"}:
+            name = "SWE-bench/SWE-bench"
+        elif name.lower() in {
+            "swe-bench-lite",
+            "swebench-lite",
+            "swe_bench_lite",
+            "swe-bench_lite",
+            "lite",
+        }:
+            name = "SWE-bench/SWE-bench_Lite"
+        parquet_path = Path(name) / f"{split}.parquet"
+        if parquet_path.exists():
+            dataset = cast(
+                Dataset,
+                load_dataset("parquet", data_files=str(parquet_path), split="train"),
+            )
+        elif (Path(name) / split / "dataset_info.json").exists():
+            dataset = cast(Dataset, load_from_disk(Path(name) / split))
+        else:
+            dataset = cast(Dataset, load_dataset(name, split=split))
+    dataset_ids = {instance["instance_id"] for instance in dataset}
+    if instance_ids:
+        if instance_ids - dataset_ids:
+            raise ValueError(
+                (
+                    "Some instance IDs not found in dataset!"
+                    f"\nMissing IDs:\n{' '.join(instance_ids - dataset_ids)}"
+                )
+            )
+        dataset = [
+            instance for instance in dataset if instance["instance_id"] in instance_ids
         ]
-
-    # Load from Hugging Face Datasets
-    if name.lower() in {"swe-bench", "swebench", "swe_bench"}:
-        name = "princeton-nlp/SWE-bench"
-    elif name.lower() in {"swe-bench-lite", "swebench-lite", "swe_bench_lite", "swe-bench_lite", "lite"}:
-        name = "princeton-nlp/SWE-bench_Lite"
-    dataset = cast(Dataset, load_dataset(name, split=split))
     return [cast(SWEbenchInstance, instance) for instance in dataset]
-
-
-### MARK - Patch Correction
-PATCH_PATTERN = re.compile(
-    r"(?:diff[\w\_\.\ \/\-]+\n)?\-\-\-\s+a\/(?:.*?)\n\+\+\+\s+b\/(?:.*?)(?=diff\ |\-\-\-\ a\/|\Z)",
-    re.DOTALL,
-)
-PATCH_FILE_PATTERN = re.compile(r"\-\-\-\s+a\/(?:.+)\n\+\+\+\s+b\/(?:.+)")
-PATCH_HUNK_PATTERN = re.compile(
-    r"\@\@\s+\-(\d+),(\d+)\s+\+(\d+),(\d+)\s+\@\@(.+?)(?=diff\ |\-\-\-\ a\/|\@\@\ \-|\Z)",
-    re.DOTALL,
-)
-
-
-def get_first_idx(charlist):
-    """Get index of first occurrence of "-" or "+" in charlist"""
-    first_min = charlist.index("-") if "-" in charlist else len(charlist)
-    first_plus = charlist.index("+") if "+" in charlist else len(charlist)
-    return min(first_min, first_plus)
-
-
-def get_last_idx(charlist):
-    """Get index of last occurrence of "-" or "+" in charlist"""
-    char_idx = get_first_idx(charlist[::-1])
-    last_idx = len(charlist) - char_idx
-    return last_idx + 1
-
-
-def strip_content(hunk):
-    """Remove trailing non +/- lines and trailing whitespace per line per hunk"""
-    first_chars = list(map(lambda x: None if not len(x) else x[0], hunk.split("\n")))
-    first_idx = get_first_idx(first_chars)
-    last_idx = get_last_idx(first_chars)
-    new_lines = list(map(lambda x: x.rstrip(), hunk.split("\n")[first_idx:last_idx]))
-    new_hunk = "\n" + "\n".join(new_lines) + "\n"
-    return new_hunk, first_idx - 1
-
-
-def get_hunk_stats(pre_start, pre_len, post_start, post_len, hunk, total_delta):
-    """Recalculate hunk start/end position and diff delta"""
-    stats = {"context": 0, "added": 0, "subtracted": 0}
-    hunk = hunk.split("\n", 1)[-1].strip("\n")
-    for line in hunk.split("\n"):
-        if line.startswith("-"):
-            stats["subtracted"] += 1
-        elif line.startswith("+"):
-            stats["added"] += 1
-        else:
-            stats["context"] += 1
-    context = stats["context"]
-    added = stats["added"]
-    subtracted = stats["subtracted"]
-    pre_len = context + subtracted
-    post_start = pre_start + total_delta
-    post_len = context + added
-    total_delta = total_delta + (post_len - pre_len)
-    return pre_start, pre_len, post_start, post_len, total_delta
-
-
-def extract_minimal_patch(model_patch):
-    """
-    Wrapper function that takes hunk and
-    * Removes trailing non +/- lines and trailing whitespace per line per hunk
-    * Recalculates hunk start/end position and diff delta
-    * Returns new patch
-    """
-    model_patch = model_patch.lstrip("\n")
-    new_patch = ""
-    for patch in PATCH_PATTERN.findall(model_patch):
-        total_delta = 0
-        patch_header = PATCH_FILE_PATTERN.findall(patch)[0]
-        if patch_header:
-            new_patch += patch_header + "\n"
-        for hunk in PATCH_HUNK_PATTERN.findall(patch):
-            pre_start, pre_len, post_start, post_len, content = hunk
-            pre_start, pre_len, post_start, post_len, content = list(
-                map(lambda x: int(x) if x.isnumeric() else x, hunk)
-            )
-            content, adjust_pre_start = strip_content(content)
-            pre_start += adjust_pre_start
-            pre_start, pre_len, post_start, post_len, total_delta = get_hunk_stats(
-                pre_start, pre_len, post_start, post_len, content, total_delta
-            )
-            new_patch += (
-                f"@@ -{pre_start},{pre_len} +{post_start},{post_len} @@{content}"
-            )
-    return new_patch
-
-
-def has_attribute_or_import_error(log_before):
-    """
-    Check to see if Attribute/Import-prefix is in log text
-
-    Args:
-        log_before (str): Validation log text before patch application
-    """
-    log_before = log_before.lower()
-
-    if any([x in log_before for x in ["attribute", "import"]]):
-
-        def get_lines_with_word(text, target_word):
-            # Function to extract line(s) that contains target_word
-            text, target_word = text.lower(), target_word.lower()
-            lines, hits = text.split("\n")[::-1], []
-            for line in lines:
-                if target_word in line:
-                    hits.append(line)
-            return hits
-
-        # Get line with Attribute/Import error
-        lines_1 = get_lines_with_word(log_before, "attribute")
-        lines_2 = get_lines_with_word(log_before, "import")
-        lines_1 = " ".join(lines_1)
-        lines_2 = " ".join(lines_2)
-
-        if any([(x in lines_1 or x in lines_2) for x in ["error", "fail"]]):
-            return True
-    return False
-
-
-@cache
-def get_environment_yml_by_commit(repo: str, commit: str, env_name: str) -> str:
-    for req_path in MAP_REPO_TO_ENV_YML_PATHS[repo]:
-        reqs_url = os.path.join(SWE_BENCH_URL_RAW, repo, commit, req_path)
-        reqs = requests.get(reqs_url)
-        if reqs.status_code == 200:
-            break
-    else:
-        raise ValueError(
-            f"Could not find environment.yml at paths {MAP_REPO_TO_ENV_YML_PATHS[repo]} for repo {repo} at commit {commit}"
-        )
-
-    lines = reqs.text.split("\n")
-    cleaned = []
-    for line in lines:
-        # Rename environment to given name
-        if line.startswith("name:"):
-            cleaned.append(f"name: {env_name}")
-            continue
-        cleaned.append(line)
-
-    return "\n".join(cleaned)
-
-
-def get_environment_yml(instance: SWEbenchInstance, env_name: str) -> str:
-    """
-    Get environment.yml for given task instance
-
-    Args:
-        instance (dict): SWE Bench Task instance
-        env_name (str): Rename retrieved environment.yml to this name
-    Returns:
-        environment.yml (str): Returns environment.yml as string
-    """
-    # Attempt to find environment.yml at each path based on task instance's repo
-
-    commit = (
-        instance["environment_setup_commit"]
-        if "environment_setup_commit" in instance
-        else instance["base_commit"]
-    )
-
-    return get_environment_yml_by_commit(instance["repo"], commit, env_name)
-
-
-@cache
-def get_requirements_by_commit(repo: str, commit: str) -> str:
-    for req_path in MAP_REPO_TO_REQS_PATHS[repo]:
-        reqs_url = os.path.join(SWE_BENCH_URL_RAW, repo, commit, req_path)
-        reqs = requests.get(reqs_url)
-        if reqs.status_code == 200:
-            break
-    else:
-        raise ValueError(
-            f"Could not find requirements.txt at paths {MAP_REPO_TO_REQS_PATHS[repo]} for repo {repo} at commit {commit}"
-        )
-
-    lines = reqs.text
-    original_req = []
-    additional_reqs = []
-    req_dir = "/".join(req_path.split("/")[:-1])
-    exclude_line = lambda line: any(
-        [line.strip().startswith(x) for x in ["-e .", "#", ".[test"]]
-    )
-
-    for line in lines.split("\n"):
-        if line.strip().startswith("-r"):
-            # Handle recursive requirements
-            file_name = line[len("-r") :].strip()
-            reqs_url = os.path.join(
-                SWE_BENCH_URL_RAW,
-                repo,
-                commit,
-                req_dir,
-                file_name,
-            )
-            reqs = requests.get(reqs_url)
-            if reqs.status_code == 200:
-                for line_extra in reqs.text.split("\n"):
-                    if not exclude_line(line_extra):
-                        additional_reqs.append(line_extra)
-        else:
-            if not exclude_line(line):
-                original_req.append(line)
-
-    # Combine all requirements into single text body
-    additional_reqs.append("\n".join(original_req))
-    all_reqs = "\n".join(additional_reqs)
-
-    return all_reqs
-
-
-def get_requirements(instance: SWEbenchInstance) -> str:
-    """
-    Get requirements.txt for given task instance
-
-    Args:
-        instance (dict): task instance
-    Returns:
-        requirements.txt (str): Returns requirements.txt as string
-    """
-    # Attempt to find requirements.txt at each path based on task instance's repo
-    commit = (
-        instance["environment_setup_commit"]
-        if "environment_setup_commit" in instance
-        else instance["base_commit"]
-    )
-
-    return get_requirements_by_commit(instance["repo"], commit)
-
-
-def get_test_directives(instance: SWEbenchInstance) -> list:
-    """
-    Get test directives from the test_patch of a task instance
-
-    Args:
-        instance (dict): task instance
-    Returns:
-        directives (list): List of test directives
-    """
-    # For seq2seq code repos, testing command is fixed
-    if instance["repo"] == "swe-bench/humaneval":
-        return ["test.py"]
-
-    # Get test directives from test patch and remove non-test files
-    diff_pat = r"diff --git a/.* b/(.*)"
-    test_patch = instance["test_patch"]
-    directives = re.findall(diff_pat, test_patch)
-    directives = [
-        d for d in directives if not any(d.endswith(ext) for ext in NON_TEST_EXTS)
-    ]
-
-    # For Django tests, remove extension + "tests/" prefix and convert slashes to dots (module referencing)
-    if instance["repo"] == "django/django":
-        directives_transformed = []
-        for d in directives:
-            d = d[: -len(".py")] if d.endswith(".py") else d
-            d = d[len("tests/") :] if d.startswith("tests/") else d
-            d = d.replace("/", ".")
-            directives_transformed.append(d)
-        directives = directives_transformed
-
-    return directives
 
 
 def str2bool(v):
@@ -318,3 +199,75 @@ def str2bool(v):
         return False
     else:
         raise ArgumentTypeError("Boolean value expected.")
+
+
+def optional_str(value: str) -> str | None:
+    """
+    Convert special string values to None, otherwise return the string as-is.
+    """
+    if value.lower() in ("none", "null", ""):
+        return None
+    return value
+
+
+def parse_eval_script(eval_script: str) -> list[str]:
+    """Parse an eval.sh script into a command list (strip shebang + set flags)."""
+    return [
+        line
+        for line in eval_script.strip().split("\n")
+        if line not in ("#!/bin/bash", "set -uxo pipefail")
+    ]
+
+
+def record_test_exit_code(eval_script_list: list[str]) -> list[str]:
+    """Make the eval script record the test command's own exit status.
+
+    Eval scripts end with a `git checkout` that resets the test files, and run
+    under `set -uxo pipefail` without `-e`, so the script's exit status is the
+    reset's, not the tests'. Capturing `$?` immediately after the test command
+    and echoing it after the end marker keeps the value out of the parsed region.
+    """
+    for i, line in enumerate(eval_script_list):
+        if END_TEST_OUTPUT in line:
+            return [
+                *eval_script_list[:i],
+                f"{TEST_EXIT_CODE_VAR}=$?",
+                line,
+                f'echo "{TEST_EXIT_CODE}: ${TEST_EXIT_CODE_VAR}"',
+                *eval_script_list[i + 1 :],
+            ]
+    # No end marker (unrecognized script shape): leave it untouched, and grading
+    # falls back to the pre-existing behavior of trusting the log alone.
+    return eval_script_list
+
+
+def _parse_image_assets(raw) -> dict:
+    """image_assets ships as a JSON string in the HF datasets, dict when local."""
+    if not raw:
+        return {}
+    return json.loads(raw) if isinstance(raw, str) else raw
+
+
+def make_test_spec(instance: dict) -> TestSpec:
+    """
+    Build a TestSpec from a dataset instance.
+
+    The instance dict must contain: instance_id, image, repo, version,
+    FAIL_TO_PASS, PASS_TO_PASS, log_parser, eval_type, eval_script.
+    """
+    f2p = instance["FAIL_TO_PASS"]
+    p2p = instance["PASS_TO_PASS"]
+    return TestSpec(
+        instance_id=instance["instance_id"],
+        image=instance["image"],
+        eval_script_list=record_test_exit_code(
+            parse_eval_script(instance["eval_script"])
+        ),
+        repo=instance["repo"],
+        version=instance["version"],
+        FAIL_TO_PASS=json.loads(f2p) if isinstance(f2p, str) else f2p,
+        PASS_TO_PASS=json.loads(p2p) if isinstance(p2p, str) else p2p,
+        log_parser=instance["log_parser"],
+        eval_type=instance["eval_type"],
+        image_assets=_parse_image_assets(instance.get("image_assets")),
+    )

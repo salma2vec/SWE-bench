@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+
 import logging
 import re
 import requests
@@ -6,12 +9,41 @@ import time
 from bs4 import BeautifulSoup
 from ghapi.core import GhApi
 from fastcore.net import HTTP404NotFoundError, HTTP403ForbiddenError
-from typing import Optional
+from typing import Callable, Iterator, Optional
+from unidiff import PatchSet
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/using-keywords-in-issues-and-pull-requests
+PR_KEYWORDS = {
+    "close",
+    "closes",
+    "closed",
+    "fix",
+    "fixes",
+    "fixed",
+    "resolve",
+    "resolves",
+    "resolved",
+}
+
+
+def build_issues_pattern(clone_url: str | None = None) -> re.Pattern:
+    """Match "<keyword> #123", and full issue URLs for this repo when known.
+
+    e.g. both "fixes #123" and "fixes https://github.com/owner/repo/issues/123".
+    The URL is escaped so its dots cannot act as regex wildcards.
+    """
+    markers = [r"\#"]
+    if clone_url:
+        repo_url = (
+            clone_url[: -len(".git")] if clone_url.endswith(".git") else clone_url
+        )
+        markers.append(re.escape(f"{repo_url}/issues/"))
+    return re.compile(rf"(\w+)\s+(?:{'|'.join(markers)})(\d+)")
 
 
 class Repo:
@@ -30,7 +62,7 @@ class Repo:
         self.api = GhApi(token=token)
         self.repo = self.call_api(self.api.repos.get, owner=owner, repo=name)
 
-    def call_api(self, func: callable, **kwargs) -> dict:
+    def call_api(self, func: Callable, **kwargs) -> dict | None:
         """
         API call wrapper with rate limit handling (checks every 5 minutes if rate limit is reset)
 
@@ -44,16 +76,17 @@ class Repo:
             try:
                 values = func(**kwargs)
                 return values
-            except HTTP403ForbiddenError as e:
+            except HTTP403ForbiddenError:
                 while True:
                     rl = self.api.rate_limit.get()
                     logger.info(
-                        f"[{self.owner}/{self.name}] Rate limit exceeded, waiting for 5 minutes, remaining: {rl.resources.core.remaining}"
+                        f"[{self.owner}/{self.name}] Rate limit exceeded for token {(self.token or '')[:10]}, "
+                        f"waiting for 5 minutes, remaining calls: {rl.resources.core.remaining}"
                     )
                     if rl.resources.core.remaining > 0:
                         break
                     time.sleep(60 * 5)
-            except HTTP404NotFoundError as e:
+            except HTTP404NotFoundError:
                 logger.info(f"[{self.owner}/{self.name}] Resource not found {kwargs}")
                 return None
 
@@ -66,20 +99,10 @@ class Repo:
         Return:
             resolved_issues (list): list of issue numbers referenced by PR
         """
-        # Define 1. issue number regex pattern 2. comment regex pattern 3. keywords
-        issues_pat = re.compile(r"(\w+)\s+\#(\d+)")
+
+        clone_url = ((pull.get("base") or {}).get("repo") or {}).get("clone_url")
+        issues_pat = build_issues_pattern(clone_url)
         comments_pat = re.compile(r"(?s)<!--.*?-->")
-        keywords = {
-            "close",
-            "closes",
-            "closed",
-            "fix",
-            "fixes",
-            "fixed",
-            "resolve",
-            "resolves",
-            "resolved",
-        }
 
         # Construct text to search over for issue numbers from PR body and commit messages
         text = pull.title if pull.title else ""
@@ -93,25 +116,25 @@ class Repo:
         # Remove comments from text
         text = comments_pat.sub("", text)
         # Look for issue numbers in text via scraping <keyword, number> patterns
-        references = dict(issues_pat.findall(text))
-        resolved_issues = list()
+        references = issues_pat.findall(text)
+        resolved_issues_set = set()
         if references:
-            for word, issue_num in references.items():
-                if word.lower() in keywords:
-                    resolved_issues.append(issue_num)
-        return resolved_issues
+            for word, issue_num in references:
+                if word.lower() in PR_KEYWORDS:
+                    resolved_issues_set.add(issue_num)
+        return list(resolved_issues_set)
 
     def get_all_loop(
         self,
-        func: callable,
+        func: Callable,
         per_page: int = 100,
         num_pages: Optional[int] = None,
         quiet: bool = False,
         **kwargs,
-    ) -> list:
+    ) -> Iterator:
         """
         Return all values from a paginated API endpoint.
-        
+
         Args:
             func (callable): API function to call
             per_page (int): number of values to return per page
@@ -136,36 +159,41 @@ class Repo:
                 if not quiet:
                     rl = self.api.rate_limit.get()
                     logger.info(
-                        f"[{self.owner}/{self.name}] Processed page {page} ({per_page} values per page). Remaining calls: {rl.resources.core.remaining}"
+                        f"[{self.owner}/{self.name}] Processed page {page} ({per_page} values per page). "
+                        f"Remaining calls: {rl.resources.core.remaining}"
                     )
                 if num_pages is not None and page >= num_pages:
                     break
                 page += 1
             except Exception as e:
                 # Rate limit handling
-                logger.error(f"Error processing page {page}: {e}")
+                logger.error(
+                    f"[{self.owner}/{self.name}] Error processing page {page} "
+                    f"w/ token {(self.token or '')[:10]} - {e}"
+                )
                 while True:
                     rl = self.api.rate_limit.get()
                     if rl.resources.core.remaining > 0:
                         break
                     logger.info(
-                        f"[{self.owner}/{self.name}] Waiting for rate limit reset, checking again in 5 minutes"
+                        f"[{self.owner}/{self.name}] Waiting for rate limit reset "
+                        f"for token {(self.token or '')[:10]}, checking again in 5 minutes"
                     )
                     time.sleep(60 * 5)
         if not quiet:
             logger.info(
-                f"[{self.owner}/{self.name}] Processed {(page-1)*per_page + len(values)} values"
+                f"[{self.owner}/{self.name}] Processed {(page - 1) * per_page + len(values)} values"
             )
 
     def get_all_issues(
         self,
         per_page: int = 100,
         num_pages: Optional[int] = None,
-        direction: str = "asc",
+        direction: str = "desc",
         sort: str = "created",
         state: str = "closed",
         quiet: bool = False,
-    ) -> list:
+    ) -> Iterator:
         """
         Wrapper for API call to get all issues from repo
 
@@ -192,11 +220,11 @@ class Repo:
         self,
         per_page: int = 100,
         num_pages: Optional[int] = None,
-        direction: str = "asc",
+        direction: str = "desc",
         sort: str = "created",
         state: str = "closed",
-        quiet: str = False,
-    ) -> list:
+        quiet: bool = False,
+    ) -> Iterator:
         """
         Wrapper for API call to get all PRs from repo
 
@@ -308,46 +336,23 @@ def extract_patches(pull: dict, repo: Repo) -> tuple[str, str]:
         patch_change_str (str): gold patch
         patch_test_str (str): test patch
     """
-    # Convert diff to patch format with "index" lines removed
     patch = requests.get(pull["diff_url"]).text
-    if patch.endswith("\n"):
-        patch = patch[:-1]
-    # Create change patch and test patch
-    patch_change, patch_test = [], []
-
-    # Flag to determine if current diff block is a test or general change
-    # Values: 'test', 'diff', None
-    flag = None
-
-    for line in patch.split("\n"):
-        # Exclude commit specific metadata
-        if line.startswith("index "):
-            continue
-        # Determine if current diff block is a test or general change
-        if line.startswith("diff --git a/"):
-            words = set(re.split(r" |_|\/|\.", line.lower()))
-            flag = (
-                "test"
-                if ("test" in words or "tests" in words or "testing" in words)
-                else "diff"
-            )
-            if flag != "test" and not line.strip().endswith(".py"):
-                flag = None
-        # Append line to separate patch depending on flag status
-        if flag == "test":
-            patch_test.append(line)
-        elif flag == "diff":
-            patch_change.append(line)
-
-    patch_change_str = "\n".join(patch_change) + "\n" if len(patch_change) > 0 else ""
-    patch_test_str = "\n".join(patch_test) + "\n" if len(patch_test) > 0 else ""
-    return patch_change_str, patch_test_str
+    patch_test = ""
+    patch_fix = ""
+    for hunk in PatchSet(patch):
+        if any(
+            test_word in hunk.path for test_word in ["test", "tests", "e2e", "testing"]
+        ):
+            patch_test += str(hunk)
+        else:
+            patch_fix += str(hunk)
+    return patch_fix, patch_test
 
 
 ### MARK: Repo Specific Parsing Functions ###
 def extract_problem_statement_and_hints_django(
     pull: dict, repo: Repo
-) -> tuple[str, str]:
+) -> tuple[str, list[str]]:
     """
     Get problem statement and hints from issues associated with a pull request
 
@@ -390,7 +395,6 @@ def extract_problem_statement_and_hints_django(
         # Get all comments before first commit
         comments_html = soup.find("div", {"id": "changelog"})
         div_blocks = comments_html.find_all("div", class_="change")
-        comments = []
         # Loop through each div block
         for div_block in div_blocks:
             # Find the comment text and timestamp
@@ -403,7 +407,14 @@ def extract_problem_statement_and_hints_django(
             timestamp = timestamp_resp["title"]
             if timestamp.startswith("See timeline at "):
                 timestamp = timestamp[len("See timeline at ") :]
-            timestamp = time.mktime(time.strptime(timestamp, "%m/%d/%y %H:%M:%S"))
+            if "/" in timestamp:
+                timestamp = time.mktime(time.strptime(timestamp, "%m/%d/%y %H:%M:%S"))
+            elif "," in timestamp:
+                timestamp = time.mktime(
+                    time.strptime(timestamp, "%b %d, %Y, %I:%M:%S %p")
+                )
+            else:
+                raise ValueError(f"Timestamp format not recognized: {timestamp}")
 
             # Append the comment and timestamp as a tuple to the comments list
             if timestamp < commit_time:
